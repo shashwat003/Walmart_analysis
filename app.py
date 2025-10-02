@@ -24,8 +24,8 @@ st.set_page_config(page_title="Walmart Valuation Explorer", page_icon="📊",
                    layout="wide", initial_sidebar_state="expanded")
 
 # Default file paths (your uploads). You can still upload a new one in the UI.
-DEFAULT_XLSX_PATH = "/mnt/data/FIN42030 WMT Valuation (2).xlsx"
-DEFAULT_ASSIGNMENT_PDF = "/mnt/data/Assignment1 (1).pdf"
+DEFAULT_XLSX_PATH = "FIN42030 WMT Valuation (2).xlsx"
+DEFAULT_ASSIGNMENT_PDF = "Assignment1 (1).pdf"
 
 # Optional Azure OpenAI (same fields as before — safe fallback if unset)
 AZURE_OPENAI_ENDPOINT    = os.getenv("AZURE_OPENAI_ENDPOINT", "https://testaisentiment.openai.azure.com/")
