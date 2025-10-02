@@ -9,3 +9,4 @@ azure-ai-textanalytics
 AzureOpenAI
 plotly>=5.18
 openai>=1.0.0
+tabulate
