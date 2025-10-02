@@ -1,58 +1,64 @@
-# app.py — Walmart Valuation Explorer (Analyst UI + Chat)
-# - Sidebar sheet navigator (searchable)
-# - Finance Overview (Revenue, EBITDA, FCF, margins, WACC if found)
-# - Smart charts per sheet (handles year headers & real dates)
+# app.py — Walmart Valuation Explorer (Readable UI + Analyst KPIs + Chat)
+# - Sidebar navigator (search + select) for all sheets
+# - Finance KPIs (Revenue, EBITDA, FCF, WACC) with CAGR where possible
+# - Clean charts using Plotly (auto-detect date vs. "years-in-columns")
 # - Per-sheet English summary
-# - Chatbot grounded in workbook + general Walmart context (Azure OpenAI optional)
+# - Chatbot grounded in workbook (optional via Azure OpenAI env vars)
+# - Robust to "Unnamed" columns and non-numeric text
 
-import os, io, re, json, pkgutil, sys
+import os, re, json, sys, pkgutil
 from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-# ============ CONFIG ============
-FILE_NAME = "FIN42030 WMT Valuation (2).xlsx"   # Excel kept next to app.py
-PAGE_TITLE = "Walmart Valuation Explorer"
+# ============== CONFIG ==============
+FILE_NAME = "FIN42030 WMT Valuation (2).xlsx"  # keep this file next to app.py
 
-
+# Optional Azure OpenAI (set as repository secrets/env in Streamlit Cloud)
 # Hard-coded Azure OpenAI (optional; safe fallback if unset)
 AZURE_OPENAI_ENDPOINT    = "https://testaisentiment.openai.azure.com/"
 AZURE_OPENAI_API_KEY     = "cb1c33772b3c4edab77db69ae18c9a43"
 AZURE_OPENAI_API_VERSION = "2024-02-15-preview"
 AZURE_OPENAI_DEPLOYMENT  = "aipocexploration"
 
-st.set_page_config(page_title=PAGE_TITLE, page_icon="📊", layout="wide")
+# ============== PAGE / THEME ==============
+st.set_page_config(page_title="Walmart Valuation Explorer", page_icon="📊", layout="wide")
 
-# ------ Theme (readable, analyst-y) ------
-BG, PANEL, BORDER, TEXT, MUTED = "#0b1220", "#0f172a", "#233043", "#e5edf7", "#98a6bd"
+# High-contrast, readable dark theme
+BG, PANEL, BORDER, TEXT, MUTED = "#0b1220", "#0f172a", "#233043", "#e8f1ff", "#9ab0cf"
 PRIMARY = "#22d3ee"
+
 st.markdown(f"""
 <style>
-  html, body, .block-container {{ background:{BG}; color:{TEXT}; }}
-  .card {{ background:{PANEL}; border:1px solid {BORDER}; border-radius:14px; padding:16px; }}
-  .headline {{ font-size:1.8rem; font-weight:800; letter-spacing:-.01em; }}
-  .soft {{ color:{MUTED}; }}
-  .pill {{ display:inline-flex; gap:8px; padding:6px 12px; border-radius:999px; font-size:.85rem; 
-           background:rgba(34,211,238,.12); color:{PRIMARY}; border:1px solid rgba(34,211,238,.28); }}
-  .kpi {{ background:#0b1324; border:1px solid {BORDER}; border-radius:14px; padding:14px; text-align:center; }}
-  .kpi .v {{ font-size:1.3rem; font-weight:800; }}
-  .kpi .l {{ font-size:.85rem; color:{MUTED}; }}
-  /* make sidebar comfy */
-  .css-1d391kg, .css-12oz5g7 {{ padding-top: 1rem; }}
+  :root {{ --text:{TEXT}; --muted:{MUTED}; --panel:{PANEL}; --border:{BORDER}; --primary:{PRIMARY}; }}
+  html, body, .block-container {{ background:{BG}; color:{TEXT}; font-size:16px; }}
+  .headline {{ font-size:2rem; font-weight:900; letter-spacing:-.01em; margin-bottom:.5rem; }}
+  .subtle  {{ color:{MUTED}; }}
+  .card    {{ background:{PANEL}; border:1px solid {BORDER}; border-radius:16px; padding:16px; }}
+  .kpi     {{ background:#0b1324; border:1px solid {BORDER}; border-radius:16px; padding:18px; }}
+  .kpi h4  {{ margin:0 0 .4rem 0; font-size:.95rem; color:{MUTED}; }}
+  .kpi .v  {{ font-size:1.6rem; font-weight:900; }}
+  .kpi .d  {{ font-size:.9rem; color:{MUTED}; }}
+  /* sidebar readability */
+  section[data-testid="stSidebar"] .css-1v0mbdj, section[data-testid="stSidebar"] .css-1d391kg {{ padding-top:8px; }}
+  /* fix long selectbox entries */
+  div[data-baseweb="select"] span {{ white-space:normal !important; }}
 </style>
 """, unsafe_allow_html=True)
 
-# ------ Optional LLM (Azure OpenAI) ------
-client = None
+# ============== OPTIONAL LLM CLIENT ==============
 OPENAI_OK = False
+client = None
 if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT:
     try:
         from openai import AzureOpenAI
         client = AzureOpenAI(
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             api_key=AZURE_OPENAI_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION
+            api_version=AZURE_OPENAI_API_VERSION,
         )
         OPENAI_OK = True
     except Exception:
@@ -60,28 +66,42 @@ if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT:
 
 def ask_gpt(messages, temperature=0.2, max_tokens=900):
     if not OPENAI_OK:
-        return "(LLM not configured.)"
+        return "(LLM not configured. Add Azure env vars to enable chat.)"
     try:
         r = client.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
         )
         return r.choices[0].message.content
     except Exception as e:
         return f"(LLM error: {e})"
 
-# ------ Helpers ------
+# ============== HELPERS ==============
 def need_openpyxl() -> bool:
     return pkgutil.find_loader("openpyxl") is None
 
 @st.cache_data(show_spinner=False)
 def load_workbook(path: str) -> Dict[str, pd.DataFrame]:
     if need_openpyxl():
-        raise ImportError("openpyxl is not installed in this environment. Add it to requirements.txt and redeploy.")
+        raise ImportError("openpyxl not installed in this environment. Add it to requirements.txt and redeploy.")
     xl = pd.ExcelFile(path, engine="openpyxl")
-    return {name: xl.parse(name) for name in xl.sheet_names}
+    dfs = {}
+    for name in xl.sheet_names:
+        df = xl.parse(name)
+        # clean: drop empty columns, trim headers, remove extra "Unnamed" if totally empty
+        new_cols = []
+        for c in df.columns:
+            s = str(c).strip()
+            new_cols.append(s)
+        df.columns = new_cols
+        # drop fully empty columns
+        empty_cols = [c for c in df.columns if df[c].isna().all()]
+        if empty_cols:
+            df = df.drop(columns=empty_cols)
+        dfs[name] = df
+    return dfs
 
 def is_date_col(s: pd.Series) -> bool:
     if pd.api.types.is_datetime64_any_dtype(s): return True
@@ -92,17 +112,20 @@ def is_date_col(s: pd.Series) -> bool:
         except Exception: return False
     return False
 
-def num_cols(df): return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-def date_cols(df): return [c for c in df.columns if is_date_col(df[c])]
+def num_cols(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+def date_cols(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if is_date_col(df[c])]
 
 def find_year_header_cols(df: pd.DataFrame) -> List[str]:
     pat = re.compile(r"(?:19|20)\d{2}")
     yearish = [c for c in df.columns if pat.search(str(c))]
-    if yearish:
-        tmp = df.copy()
-        for c in yearish: tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
-        yearish = [c for c in yearish if tmp[c].notna().any()]
-    return yearish
+    if not yearish: return []
+    tmp = df.copy()
+    for c in yearish:
+        tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+    return [c for c in yearish if tmp[c].notna().any()]
 
 def wide_years_to_long(df: pd.DataFrame, year_cols: List[str], label_col=None) -> pd.DataFrame | None:
     if not year_cols: return None
@@ -110,103 +133,88 @@ def wide_years_to_long(df: pd.DataFrame, year_cols: List[str], label_col=None) -
         non_year = [c for c in df.columns if c not in year_cols]
         label_col = non_year[0] if non_year else None
     work = df.copy()
-    for yc in year_cols: work[yc] = pd.to_numeric(work[yc], errors="coerce")
+    for yc in year_cols:
+        work[yc] = pd.to_numeric(work[yc], errors="coerce")
     long = work.melt(id_vars=[label_col] if label_col else None, value_vars=year_cols,
                      var_name="Year", value_name="Value")
     long["Year"] = long["Year"].astype(str).str.extract(r"((?:19|20)\d{2})").astype(float)
     long = long.dropna(subset=["Year","Value"])
     if long.empty: return None
     long["Year"] = long["Year"].astype(int)
+    # choose up to 5 most varying series to avoid clutter
     if label_col and label_col in long.columns:
-        vard = long.groupby(label_col)["Value"].var().sort_values(ascending=False)
-        long = long[long[label_col].isin(list(vard.head(5).index))]
+        var_rank = long.groupby(label_col)["Value"].var().sort_values(ascending=False)
+        long = long[long[label_col].isin(list(var_rank.head(5).index))]
     return long
 
-def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> tuple[pd.DataFrame, List[str]]:
+def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     out = df.copy(); keep=[]
     for c in cols:
         out[c] = pd.to_numeric(out[c], errors="coerce")
         if out[c].notna().any(): keep.append(c)
     return out, keep
 
-def sheet_profile(df: pd.DataFrame, name: str) -> dict:
-    # small profile object that feeds the chatbot
-    stats = {}
-    for c in df.columns:
-        s = df[c]
-        if pd.api.types.is_numeric_dtype(s):
-            stats[str(c)] = {
-                "count": int(s.count()),
-                "mean": float(np.nanmean(s)) if s.count() else np.nan,
-                "min": float(np.nanmin(s)) if s.count() else np.nan,
-                "max": float(np.nanmax(s)) if s.count() else np.nan,
-            }
-    with pd.option_context("display.max_columns", 12, "display.width", 1000):
-        preview = df.head(8).to_markdown(index=False)
-    return {"name":name, "rows":int(df.shape[0]), "cols":int(df.shape[1]),
-            "columns":[str(x) for x in df.columns], "num_stats":stats, "preview":preview}
+def safe_preview(df: pd.DataFrame, n=8) -> str:
+    try:
+        import tabulate as _  # noqa
+        return df.head(n).to_markdown(index=False)
+    except Exception:
+        return df.head(n).to_string(index=False)
 
-def build_corpus(profiles: List[dict]) -> List[str]:
-    chunks=[]
-    for p in profiles:
-        chunks.append(
-f"""Sheet: {p['name']}
-Columns: {', '.join(p['columns'][:24])}
-Numeric summary: {json.dumps(p['num_stats'])[:1600]}
-Preview:
-{p['preview']}
-""")
-    return chunks or ["(no workbook context)"]
-
-def simple_retriever(query: str, chunks: List[str], top_k: int=4) -> List[str]:
-    toks = re.findall(r"[a-z0-9\-%\.]+", (query or "").lower())
-    scored=[]
-    for ch in chunks:
-        t=ch.lower(); score=sum(t.count(k) for k in toks if len(k)>2)
-        scored.append((score, ch))
-    scored.sort(key=lambda x:x[0], reverse=True)
-    return [c for s,c in scored[:top_k] if s>0] or [scored[0][1]]
+def sheet_summary_text(df: pd.DataFrame, name: str) -> str:
+    cols = [str(c) for c in df.columns]
+    hints=[]
+    low=name.lower()
+    if any(k in low for k in ["income","p&l","profit","is"]): hints.append("Appears to be an **Income Statement**; focus on growth & margins.")
+    if "balance" in low or low.endswith(" bs"):             hints.append("Looks like a **Balance Sheet**; check working capital & leverage.")
+    if any(k in low for k in ["cash","fcf","free cash","cf"]): hints.append("Reads like a **Cash Flow**; CFO vs CAPEX → FCF.")
+    if any(k in low for k in ["assumption","wacc","market","drivers","valuation"]): hints.append("Contains **Assumptions / WACC** driving valuation.")
+    year_cols = find_year_header_cols(df)
+    dcols = date_cols(df)
+    axis_hint = "time axis from a date column" if dcols else ("years in headers" if year_cols else "no obvious time axis")
+    return f"- Columns: {', '.join(cols[:12])}{'…' if len(cols)>12 else ''}\n- Chart basis: {axis_hint}\n" + (f"- Notes: {' '.join(hints)}" if hints else "")
 
 def guess_overview_metrics(dfs: Dict[str, pd.DataFrame]) -> dict:
+    """Heuristic scan to find Revenue/EBITDA/FCF/WACC columns."""
     m = {"revenue":None, "ebitda":None, "fcf":None, "wacc":None}
     for sname, df in dfs.items():
-        cols_lower = [str(c).lower() for c in df.columns]
         low = sname.lower()
-        if any(k in low for k in ["income","statement","integrated","summary","forecast","valuation","assumption","wacc","market"]):
+        if any(k in low for k in ["income","statement","integrated","summary","forecast","valuation","assumption","wacc","market","fin"]):
+            cols_lower = [str(c).lower() for c in df.columns]
             # revenue
             if m["revenue"] is None:
-                cands = [c for c in cols_lower if "revenue" in c or "sales" in c]
-                if cands: m["revenue"]=(sname, df.columns[cols_lower.index(cands[0])])
+                cand=[c for c in cols_lower if "revenue" in c or "sales" in c]
+                if cand: m["revenue"]=(sname, df.columns[cols_lower.index(cand[0])])
             # ebitda
             if m["ebitda"] is None:
-                cands = [c for c in cols_lower if "ebitda" in c]
-                if cands: m["ebitda"]=(sname, df.columns[cols_lower.index(cands[0])])
+                cand=[c for c in cols_lower if "ebitda" in c]
+                if cand: m["ebitda"]=(sname, df.columns[cols_lower.index(cand[0])])
             # fcf
             if m["fcf"] is None:
-                cands = [c for c in cols_lower if "free cash" in c or c.startswith("fcf")]
-                if cands: m["fcf"]=(sname, df.columns[cols_lower.index(cands[0])])
-            # wacc (as scalar column or cell)
+                cand=[c for c in cols_lower if "free cash" in c or c.startswith("fcf")]
+                if cand: m["fcf"]=(sname, df.columns[cols_lower.index(cand[0])])
+            # wacc
             if m["wacc"] is None:
-                wcols = [c for c in cols_lower if "wacc" in c or "discount rate" in c]
-                if wcols: m["wacc"]=(sname, df.columns[cols_lower.index(wcols[0])])
+                cand=[c for c in cols_lower if "wacc" in c or "discount rate" in c]
+                if cand: m["wacc"]=(sname, df.columns[cols_lower.index(cand[0])])
     return m
 
-def latest_and_cagr(df: pd.DataFrame, value_col: str) -> tuple[str, str]:
-    dcols = date_cols(df)
-    series = None
+def series_latest_and_cagr(df: pd.DataFrame, value_col: str) -> Tuple[str,str]:
+    """Return latest value and rough CAGR if time order can be inferred."""
+    dcols = date_cols(df); series=None
     if dcols:
-        t=dcols[0]; x=df.copy(); x[t]=pd.to_datetime(x[t], errors="coerce")
-        x=x.dropna(subset=[t]).sort_values(t); x[value_col]=pd.to_numeric(x[value_col], errors="coerce")
-        series = x[value_col].dropna()
+        t=dcols[0]
+        x=df.copy(); x[t]=pd.to_datetime(x[t], errors="coerce"); x=x.dropna(subset=[t]).sort_values(t)
+        x[value_col]=pd.to_numeric(x[value_col], errors="coerce"); series=x[value_col].dropna()
     else:
-        year_cols = find_year_header_cols(df)
-        if year_cols:
-            long = wide_years_to_long(df, year_cols)
+        ycols = find_year_header_cols(df)
+        if ycols:
+            long = wide_years_to_long(df, ycols)
             if long is not None and not long.empty:
                 series = long.groupby("Year")["Value"].sum().sort_index()
         else:
             series = pd.to_numeric(df[value_col], errors="coerce").dropna()
-    if series is None or len(series)==0: return ("—","—")
+    if series is None or series.empty: return ("—","—")
     try:
         first,last,n=float(series.iloc[0]),float(series.iloc[-1]),max(1,len(series)-1)
         cagr=(last/first)**(1/n)-1 if first>0 and last>0 else np.nan
@@ -214,14 +222,38 @@ def latest_and_cagr(df: pd.DataFrame, value_col: str) -> tuple[str, str]:
     except Exception:
         return (f"{series.iloc[-1]:,.0f}", "—")
 
-# ------ Load Excel ------
-header_left, header_right = st.columns([0.8,0.2])
-with header_left:
-    st.markdown(f'<div class="headline">{PAGE_TITLE}</div>', unsafe_allow_html=True)
-    st.caption(f"Python: {sys.executable} • openpyxl: {'yes' if not need_openpyxl() else 'no'}")
+def build_chat_corpus(dfs: Dict[str,pd.DataFrame]) -> List[str]:
+    chunks=[]
+    for name, df in dfs.items():
+        preview = safe_preview(df, n=8)
+        # small numeric summary (capped)
+        stats={}
+        for c in df.columns:
+            s=df[c]
+            if pd.api.types.is_numeric_dtype(s):
+                stats[str(c)]={"mean":float(np.nanmean(s)) if s.count() else np.nan,
+                               "min":float(np.nanmin(s)) if s.count() else np.nan,
+                               "max":float(np.nanmax(s)) if s.count() else np.nan}
+        chunks.append(
+            f"Sheet: {name}\nColumns: {', '.join(map(str, df.columns))[:350]}\n"
+            f"Numeric summary: {json.dumps(stats)[:1600]}\nPreview:\n{preview}\n"
+        )
+    return chunks
+
+def retrieve_context(q:str, chunks:List[str], k:int=4)->List[str]:
+    toks = re.findall(r"[a-z0-9\-\.%]+", (q or "").lower())
+    scored=[]
+    for ch in chunks:
+        t=ch.lower(); score=sum(t.count(tok) for tok in toks if len(tok)>2)
+        scored.append((score, ch))
+    scored.sort(key=lambda x:x[0], reverse=True)
+    return [c for s,c in scored[:k] if s>0] or [scored[0][1]]
+
+# ============== LOAD WORKBOOK ==============
+st.markdown(f'<div class="headline">Walmart Valuation Explorer</div><div class="subtle">Python: {sys.executable} • openpyxl: {"yes" if not need_openpyxl() else "no"}</div>', unsafe_allow_html=True)
 
 if not os.path.exists(FILE_NAME):
-    st.error(f"File not found: {FILE_NAME}. Keep your Excel next to app.py in the repo.")
+    st.error(f"File not found: {FILE_NAME}. Place it next to app.py.")
     st.stop()
 
 try:
@@ -229,142 +261,153 @@ try:
 except Exception as e:
     st.error(str(e)); st.stop()
 
-# Profiles & corpus for chat
-profiles = [sheet_profile(df, name) for name, df in dfs.items()]
-corpus = build_corpus(profiles)
+# ============== SIDEBAR SHEET PICKER ==============
+st.sidebar.header("Sheets")
+filter_text = st.sidebar.text_input("Filter sheets", "")
+sheet_options = [n for n in dfs.keys() if filter_text.lower() in n.lower()] or list(dfs.keys())
+selected_sheet = st.sidebar.selectbox("Select a sheet", sheet_options)
 
-# ------ Sidebar: sheet navigator + search ------
-st.sidebar.markdown("### Sheets")
-query = st.sidebar.text_input("Filter sheets", "")
-sheet_names = [n for n in dfs.keys() if query.lower() in n.lower()]
-if not sheet_names:
-    st.sidebar.info("No sheets match your filter.")
-    sheet_names = list(dfs.keys())
-selected = st.sidebar.radio("Select a sheet", sheet_names, label_visibility="collapsed", index=0)
-
-# ------ Overview KPIs (analyst-friendly) ------
+# ============== OVERVIEW KPIs ==============
 st.markdown("## Overview")
 metrics = guess_overview_metrics(dfs)
-rev_val = ebitda_val = fcf_val = "—"; rev_delta = None; wacc_val = "—"
+
+rev_val = ebitda_val = fcf_val = "—"
+rev_delta = None
+wacc_val = "—"
 
 if metrics["revenue"]:
-    v, d = latest_and_cagr(dfs[metrics["revenue"][0]], metrics["revenue"][1]); rev_val, rev_delta = v, d if d!="—" else None
+    v,d = series_latest_and_cagr(dfs[metrics["revenue"][0]], metrics["revenue"][1])
+    rev_val, rev_delta = v, (d if d!="—" else None)
 if metrics["ebitda"]:
-    v, _ = latest_and_cagr(dfs[metrics["ebitda"][0]], metrics["ebitda"][1]); ebitda_val = v
+    v,_ = series_latest_and_cagr(dfs[metrics["ebitda"][0]], metrics["ebitda"][1]); ebitda_val=v
 if metrics["fcf"]:
-    v, _ = latest_and_cagr(dfs[metrics["fcf"][0]], metrics["fcf"][1]); fcf_val = v
+    v,_ = series_latest_and_cagr(dfs[metrics["fcf"][0]], metrics["fcf"][1]); fcf_val=v
 if metrics["wacc"]:
-    # try to read a scalar-like WACC
-    wdf = dfs[metrics["wacc"][0]]
     try:
-        s = pd.to_numeric(wdf[metrics["wacc"][1]], errors="coerce").dropna()
-        if not s.empty: wacc_val = f"{float(s.iloc[0])*100:.2f}%" if s.iloc[0] < 1 else f"{float(s.iloc[0]):.2f}%"
-    except Exception: pass
+        s = pd.to_numeric(dfs[metrics["wacc"][0]][metrics["wacc"][1]], errors="coerce").dropna()
+        if not s.empty:
+            wacc_val = f"{float(s.iloc[0])*100:.2f}%" if s.iloc[0] < 1.0 else f"{float(s.iloc[0]):.2f}%"
+    except Exception:
+        pass
 
 k1,k2,k3,k4 = st.columns(4)
-with k1: st.markdown(f'<div class="kpi"><div class="l">Revenue (latest)</div><div class="v">{rev_val}</div><div class="l">{rev_delta or ""}</div></div>', unsafe_allow_html=True)
-with k2: st.markdown(f'<div class="kpi"><div class="l">EBITDA (latest)</div><div class="v">{ebitda_val}</div></div>', unsafe_allow_html=True)
-with k3: st.markdown(f'<div class="kpi"><div class="l">Free Cash Flow (latest)</div><div class="v">{fcf_val}</div></div>', unsafe_allow_html=True)
-with k4: st.markdown(f'<div class="kpi"><div class="l">WACC</div><div class="v">{wacc_val}</div></div>', unsafe_allow_html=True)
+with k1: st.markdown(f'<div class="kpi"><h4>Revenue (latest)</h4><div class="v">{rev_val}</div><div class="d">{rev_delta or ""}</div></div>', unsafe_allow_html=True)
+with k2: st.markdown(f'<div class="kpi"><h4>EBITDA (latest)</h4><div class="v">{ebitda_val}</div></div>', unsafe_allow_html=True)
+with k3: st.markdown(f'<div class="kpi"><h4>Free Cash Flow (latest)</h4><div class="v">{fcf_val}</div></div>', unsafe_allow_html=True)
+with k4: st.markdown(f'<div class="kpi"><h4>WACC</h4><div class="v">{wacc_val}</div></div>', unsafe_allow_html=True)
 
 st.divider()
 
-# ------ Main: selected sheet viewer ------
-st.markdown(f"## {selected}")
+# ============== SELECTED SHEET VIEW ==============
+st.markdown(f"## {selected_sheet}")
+df_raw = dfs[selected_sheet].copy()
 
-df = dfs[selected]
+# Drop "Unnamed" columns that are fully nan
+candidate_unnamed = [c for c in df_raw.columns if c.lower().startswith("unnamed")]
+for c in candidate_unnamed:
+    if df_raw[c].isna().all():
+        df_raw = df_raw.drop(columns=[c])
 
 with st.expander("Preview", expanded=False):
-    st.dataframe(df, use_container_width=True, height=420)
-
-# Summarise in English
-def summarise_sheet(df: pd.DataFrame, name: str) -> str:
-    cols = [str(c) for c in df.columns]
-    hints=[]
-    low=name.lower()
-    if any(k in low for k in ["income","p&l","profit"]):
-        hints.append("appears to be an *Income Statement* layout — look at revenue growth, gross/operating margin, EPS.")
-    if "balance" in low or low.endswith(" bs"):
-        hints.append("looks like a *Balance Sheet* — check working capital, leverage, cash & debt trends.")
-    if any(k in low for k in ["cash","fcf","free cash","cf"]):
-        hints.append("reads like *Cash Flow* — compare CFO vs CAPEX to infer FCF.")
-    if any(k in low for k in ["assumption","wacc","market","drivers"]):
-        hints.append("contains *Assumptions/WACC* — verify discount rate, growth, terminal inputs that drive valuation.")
-    year_cols = find_year_header_cols(df)
-    dcols = date_cols(df)
-    axis_hint = "time axis from the first date column" if dcols else ("years in headers" if year_cols else "no obvious time axis")
-    return f"- Columns detected: {', '.join(cols[:12])}{'…' if len(cols)>12 else ''}\n- Chart basis: {axis_hint}\n" + (f"- Notes: {', '.join(hints)}" if hints else "")
+    st.dataframe(df_raw, use_container_width=True, height=420)
 
 with st.expander("What’s in this sheet?", expanded=True):
-    st.markdown(summarise_sheet(df, selected))
+    st.markdown(sheet_summary_text(df_raw, selected_sheet))
 
-# Charts
-dcols = date_cols(df)
-ncols = num_cols(df)
-year_cols = find_year_header_cols(df)
+# ---- Chart controls & plotting
+dcols = date_cols(df_raw)
+ncols = num_cols(df_raw)
+ycols = find_year_header_cols(df_raw)
 
-st.markdown("### Time-series")
-plotted_ts=False
-if dcols and ncols:
-    x=dcols[0]
-    dff=df.copy()
-    dff[x]=pd.to_datetime(dff[x], errors="coerce")
-    dff=dff.dropna(subset=[x]).sort_values(x)
-    dff, safe = coerce_numeric(dff, ncols); safe=safe[:6]
-    if safe and not dff.empty:
-        st.line_chart(dff.set_index(x)[safe], use_container_width=True); plotted_ts=True
-if not plotted_ts and year_cols:
-    long = wide_years_to_long(df, year_cols)
+st.markdown("### Charts")
+
+# time-series
+ts_col = None
+if dcols:
+    ts_col = dcols[0]
+    df_ts = df_raw.copy()
+    df_ts[ts_col] = pd.to_datetime(df_ts[ts_col], errors="coerce")
+    df_ts = df_ts.dropna(subset=[ts_col]).sort_values(ts_col)
+    df_ts, safe = coerce_numeric(df_ts, ncols)
+    targets = st.multiselect("Select series to plot", options=safe, default=safe[:3], help="Pick numeric columns to show")
+    if targets:
+        fig = px.line(df_ts, x=ts_col, y=targets)
+        fig.update_layout(height=360, template="plotly_dark", margin=dict(l=10,r=10,t=10,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No numeric columns found to plot against the time column.")
+elif ycols:
+    long = wide_years_to_long(df_raw, ycols)
     if long is not None and not long.empty:
-        label_cols=[c for c in long.columns if c not in ("Year","Value")]
-        if label_cols:
-            piv = long.pivot_table(index="Year", columns=label_cols[0], values="Value", aggfunc="mean").sort_index()
-            st.line_chart(piv, use_container_width=True); plotted_ts=True
-if not plotted_ts:
-    st.info("No reliable time axis found.")
+        label_cols = [c for c in long.columns if c not in ("Year","Value")]
+        label = label_cols[0] if label_cols else None
+        if label:
+            choices = sorted(long[label].unique().tolist())
+            default_choices = choices[:min(4,len(choices))]
+            selected = st.multiselect("Select series to plot", choices, default_choices)
+            subset = long[long[label].isin(selected)] if selected else long
+            fig = px.line(subset, x="Year", y="Value", color=label, markers=True)
+            fig.update_layout(height=360, template="plotly_dark", margin=dict(l=10,r=10,t=10,b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            fig = px.line(long, x="Year", y="Value")
+            fig.update_layout(height=360, template="plotly_dark", margin=dict(l=10,r=10,t=10,b=10))
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Couldn’t reshape year columns into a time-series.")
+else:
+    st.info("No date or year structure detected to build a time-series.")
 
+# category bars
 st.markdown("### Category summary")
-# small-cardinality text columns
-cats=[]
-for c in df.columns:
-    if pd.api.types.is_numeric_dtype(df[c]): continue
+cat_cols=[]
+for c in df_raw.columns:
+    if pd.api.types.is_numeric_dtype(df_raw[c]): 
+        continue
     try:
-        u=df[c].nunique(dropna=True)
-        if 1 < u <= 20: cats.append(c)
+        u = df_raw[c].nunique(dropna=True)
+        if 1 < u <= 20: cat_cols.append(c)
     except Exception: pass
-if cats:
-    cat=cats[0]
-    co=df.copy(); agg_cols=[]
-    for c in df.columns:
+
+if cat_cols:
+    cat = st.selectbox("Group by", options=cat_cols, index=0)
+    co = df_raw.copy()
+    agg_candidates=[]
+    for c in df_raw.columns:
         if c==cat: continue
         co[c]=pd.to_numeric(co[c], errors="coerce")
-        if co[c].notna().any(): agg_cols.append(c)
-    show=agg_cols[:3]
-    if show:
-        try:
-            agg=co.groupby(cat)[show].sum(numeric_only=True).sort_values(show[0], ascending=False).head(20)
-            st.bar_chart(agg, use_container_width=True)
-        except Exception:
-            st.caption("Could not render grouped bars.")
+        if co[c].notna().any(): agg_candidates.append(c)
+    yagg = st.multiselect("Aggregate numeric columns", options=agg_candidates, default=agg_candidates[:1])
+    if yagg:
+        agg = co.groupby(cat)[yagg].sum(numeric_only=True).sort_values(yagg[0], ascending=False).head(30).reset_index()
+        fig = px.bar(agg, x=cat, y=yagg, barmode="group")
+        fig.update_layout(height=360, template="plotly_dark", margin=dict(l=10,r=10,t=10,b=10), xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.caption("No numeric data to aggregate by category.")
+        st.caption("No numeric columns to aggregate by category.")
 else:
     st.caption("No small-cardinality category column detected.")
 
+# histograms
 st.markdown("### Numeric histograms")
-co=df.copy(); num_cands=[]
-for c in df.columns:
+co = df_raw.copy()
+numeric_candidates=[]
+for c in df_raw.columns:
     co[c]=pd.to_numeric(co[c], errors="coerce")
-    if co[c].notna().any(): num_cands.append(c)
-for c in num_cands[:3]:
-    st.markdown(f"**{c}**")
-    try:
-        st.bar_chart(co[c].dropna().reset_index(drop=True), use_container_width=True)
-    except Exception:
-        st.caption("Could not render histogram.")
+    if co[c].notna().any():
+        numeric_candidates.append(c)
+if numeric_candidates:
+    pick = st.multiselect("Choose columns for histograms", options=numeric_candidates, default=numeric_candidates[:2])
+    for c in pick[:3]:
+        fig = px.histogram(co, x=c, nbins=40)
+        fig.update_layout(height=300, template="plotly_dark", margin=dict(l=10,r=10,t=10,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.caption("No numeric data available for histograms.")
 
+# correlation
 st.markdown("### Correlation (numeric)")
-num_for_corr=[c for c in co.columns if pd.api.types.is_numeric_dtype(co[c]) and co[c].notna().any()]
+num_for_corr = [c for c in co.columns if pd.api.types.is_numeric_dtype(co[c]) and co[c].notna().any()]
 if len(num_for_corr) >= 2:
     corr = co[num_for_corr].corr(numeric_only=True)
     st.dataframe(corr.style.background_gradient(cmap="Blues"), use_container_width=True)
@@ -373,38 +416,36 @@ else:
 
 st.divider()
 
-# ------ Chatbot (grounded in workbook) ------
+# ============== ANALYST CHAT ==============
 st.markdown("## Analyst Chat")
-st.caption("Ask anything about Walmart or this workbook. I’ll cite sheet names when I use workbook numbers.")
-if "chat" not in st.session_state:
-    st.session_state.chat = [{"role":"assistant","content":"Hi! Ask about assumptions, WACC, margins, growth, FCF, or any tab."}]
+st.caption("Ask about assumptions, WACC, segment growth, margins, FCF, or sensitivity. I’ll cite sheet names when I use workbook numbers.")
 
-# render history
+if "chat" not in st.session_state:
+    st.session_state.chat=[{"role":"assistant","content":"Hi! Which sheet or metric would you like to discuss?"}]
+
+# build / cache corpus once
+if "corpus" not in st.session_state:
+    st.session_state.corpus = build_chat_corpus(dfs)
+
 for m in st.session_state.chat:
     with st.chat_message("assistant" if m["role"]=="assistant" else "user"):
         st.write(m["content"])
 
-prompt = st.chat_input("Type your question…")
-SYSTEM = """You are a Walmart (NYSE: WMT) valuation analyst.
-Use the provided workbook context if it contains the answer; name the sheet(s) you used.
-If the workbook lacks the data, say so and answer with general finance knowledge about Walmart only if relevant.
-Be concise; provide numeric answers when possible; note assumptions briefly.
-"""
-
-def chat_over_sheets(user_msg: str) -> str:
-    ctx_parts = simple_retriever(user_msg, corpus, top_k=4)
-    context = "\n\n---\n\n".join([str(c) for c in ctx_parts])
+user_q = st.chat_input("Type your question…")
+SYS = """You are a Walmart valuation analyst. Prefer answers grounded in the provided workbook context; cite the sheet names you used. 
+Be concise and numeric where possible. If the workbook lacks the answer, say so briefly then answer with general Walmart finance knowledge only if appropriate."""
+def answer_with_context(q: str) -> str:
+    ctx = retrieve_context(q, st.session_state.corpus, k=4)
     messages=[
-        {"role":"system","content":SYSTEM},
-        {"role":"user","content": f"Workbook context:\n{context}\n\nQuestion: {user_msg}"}
+        {"role":"system","content":SYS},
+        {"role":"user","content": "Workbook context:\n" + "\n\n---\n\n".join(ctx) + f"\n\nQuestion: {q}"}
     ]
     out = ask_gpt(messages)
-    if out.startswith("("):
-        return "LLM not configured. Add Azure OpenAI env vars to enable chat."
+    if out.startswith("("):   # no LLM
+        return "Chat is disabled (no Azure OpenAI env vars). You can still use the charts and summaries above."
     return out
 
-if prompt:
-    st.session_state.chat.append({"role":"user","content":prompt})
-    reply = chat_over_sheets(prompt)
-    st.session_state.chat.append({"role":"assistant","content":reply})
+if user_q:
+    st.session_state.chat.append({"role":"user","content":user_q})
+    st.session_state.chat.append({"role":"assistant","content":answer_with_context(user_q)})
     st.rerun()
