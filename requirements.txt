@@ -2,5 +2,10 @@ streamlit
 pandas
 numpy
 openpyxl
-openai
 matplotlib
+scipy
+sympy
+azure-ai-textanalytics
+AzureOpenAI
+plotly>=5.18
+openai>=1.0.0
